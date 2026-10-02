@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>AI 视频播放器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #000; overflow: hidden;
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  #stage { position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center; }
+  #frame-wrap { position: relative; width: min(100vw, calc(100vh * 16 / 9));
+    height: min(100vh, calc(100vw * 9 / 16)); background: #000; }
+  iframe { position: absolute; inset: 0; width: 100%; height: 100%;
+    border: 0; pointer-events: none; }
+
+  #subtitle { position: absolute; left: 50%; bottom: 6%;
+    transform: translateX(-50%); max-width: 86%;
+    padding: 10px 28px; border-radius: 8px;
+    background: rgba(0,0,0,.62); color: #fff;
+    font-size: clamp(20px, 2.6vw, 36px); line-height: 1.5;
+    text-align: center; text-shadow: 0 2px 6px rgba(0,0,0,.8);
+    pointer-events: none; transition: opacity .25s; }
+
+  #hud { position: absolute; top: 14px; left: 16px; right: 16px;
+    display: flex; justify-content: space-between; align-items: center;
+    color: rgba(255,255,255,.75); font-size: 14px;
+    letter-spacing: .08em; pointer-events: none; }
+  #bar { position: absolute; top: 0; left: 0; height: 3px;
+    background: #38bdf8; width: 0; transition: width .3s linear; }
+
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column;
+    gap: 18px; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.85); color: #fff; cursor: pointer; z-index: 10; }
+  #overlay h1 { font-size: clamp(26px, 4vw, 46px); font-weight: 700;
+    max-width: 80%; text-align: center; }
+  #overlay .hint { font-size: 16px; color: #94a3b8; letter-spacing: .12em; }
+  #overlay .keys { font-size: 13px; color: #64748b; }
+  #overlay.hidden { display: none; }
+
+  #end { position: absolute; inset: 0; display: none; flex-direction: column;
+    gap: 16px; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.9); color: #fff; z-index: 10; }
+  #end.show { display: flex; }
+  #end .btn { padding: 12px 36px; border: 1px solid #38bdf8;
+    border-radius: 8px; color: #38bdf8; font-size: 18px;
+    background: none; cursor: pointer; letter-spacing: .1em; }
+  #end .btn:hover { background: rgba(56,189,248,.15); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="frame-wrap">
+    <iframe id="frame" sandbox="allow-scripts" allow="autoplay"></iframe>
+    <div id="subtitle"></div>
+  </div>
+</div>
+<div id="bar"></div>
+<div id="hud">
+  <span id="hud-title"></span>
+  <span id="hud-idx"></span>
+</div>
+
+<div id="overlay">
+  <h1 id="ov-title">视频标题</h1>
+  <div class="hint">▶ 点击任意位置开始</div>
+  <div class="keys">空格 = 暂停/继续 · R = 重播 · ← → = 切换分镜</div>
+</div>
+
+<div id="end">
+  <div style="font-size:28px;font-weight:700">播放完毕</div>
+  <button class="btn" onclick="restart()">重新播放</button>
+</div>
+
+<script>
+// ===== 由 skill 生成时替换以下常量 =====
+const FRAMES = []; // [{ file, duration, narration }, ...]
+const TITLE = "";  // 视频标题
+const SHOW_SUBTITLES = true; // 是否显示字幕
+const SPEECH = true;         // 是否朗读旁白
+// ======================================
+
+const frameEl = document.getElementById('frame');
+const subEl = document.getElementById('subtitle');
+const overlay = document.getElementById('overlay');
+const endEl = document.getElementById('end');
+const barEl = document.getElementById('bar');
+const idxEl = document.getElementById('hud-idx');
+const titleEl = document.getElementById('hud-title');
+
+let cur = -1, playing = false, paused = false;
+let timer = null, tickTimer = null, elapsed = 0;
+
+document.getElementById('ov-title').textContent = TITLE || 'AI 视频';
+titleEl.textContent = TITLE || '';
+if (!SHOW_SUBTITLES) subEl.style.display = 'none';
+overlay.addEventListener('click', start);
+
+document.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  if (e.key === 'r' || e.key === 'R') restart();
+  if (e.key === 'ArrowRight' && playing) goto(cur + 1);
+  if (e.key === 'ArrowLeft' && playing) goto(cur - 1);
+});
+
+function speak(text) {
+  if (!SPEECH) return;
+  if (!('speechSynthesis' in window) || !text) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN';
+  u.rate = 1;
+  const zh = speechSynthesis.getVoices().find(v => /zh|Chinese/i.test(v.lang));
+  if (zh) u.voice = zh;
+  speechSynthesis.speak(u);
+}
+
+function start() {
+  if (!FRAMES.length) {
+    overlay.innerHTML = '<div class="hint">FRAMES 为空 — 请先由 skill 生成分镜数据</div>';
+    return;
+  }
+  overlay.classList.add('hidden');
+  endEl.classList.remove('show');
+  playing = true; paused = false;
+  goto(0);
+}
+
+function goto(i) {
+  if (i < 0) i = 0;
+  if (i >= FRAMES.length) return finish();
+  clearTimeout(timer); clearInterval(tickTimer);
+  speechSynthesis.cancel();
+  cur = i;
+  const f = FRAMES[i];
+  frameEl.src = f.file;
+  subEl.textContent = f.narration || '';
+  idxEl.textContent = (i + 1) + ' / ' + FRAMES.length;
+  elapsed = 0;
+  const total = FRAMES.reduce((s, x) => s + x.duration, 0);
+  const before = FRAMES.slice(0, i).reduce((s, x) => s + x.duration, 0);
+  barEl.style.width = (before / total * 100) + '%';
+  if (!paused) speak(f.narration);
+  scheduleNext(f.duration);
+}
+
+function scheduleNext(duration) {
+  clearTimeout(timer);
+  timer = setTimeout(() => goto(cur + 1), duration * 1000);
+  clearInterval(tickTimer);
+  const startAt = Date.now();
+  const total = FRAMES.reduce((s, x) => s + x.duration, 0);
+  const before = FRAMES.slice(0, cur).reduce((s, x) => s + x.duration, 0);
+  tickTimer = setInterval(() => {
+    if (paused) return;
+    elapsed = (Date.now() - startAt) / 1000;
+    const pct = Math.min(1, (before + elapsed) / total);
+    barEl.style.width = (pct * 100) + '%';
+  }, 200);
+}
+
+function togglePause() {
+  if (!playing) return;
+  paused = !paused;
+  if (paused) {
+    clearTimeout(timer); clearInterval(tickTimer);
+    speechSynthesis.cancel();
+    subEl.style.opacity = '.4';
+  } else {
+    subEl.style.opacity = '1';
+    const remain = Math.max(0.5, FRAMES[cur].duration - elapsed);
+    speak(FRAMES[cur].narration);
+    scheduleNext(remain);
+  }
+}
+
+function finish() {
+  playing = false;
+  speechSynthesis.cancel();
+  frameEl.src = 'about:blank';
+  subEl.textContent = '';
+  barEl.style.width = '100%';
+  endEl.classList.add('show');
+}
+
+function restart() {
+  endEl.classList.remove('show');
+  speechSynthesis.cancel();
+  playing = true; paused = false;
+  goto(0);
+}
+</script>
+</body>
+</html>
